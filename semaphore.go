@@ -1,4 +1,4 @@
-package main
+package main  // import "github.com/stefangs/homeproxy"
 
 type empty struct {}
 type Semaphore chan empty

@@ -1,4 +1,4 @@
-package main // import "github.com/stefangs/homeproxy
+package main // import "github.com/stefangs/homeproxy"
 
 import (
 	"fmt"
