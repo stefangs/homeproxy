@@ -8,6 +8,7 @@ import (
 	"time"
 	"log"
 	"strings"
+	"errors"
 )
 
 type proxyRequest struct {
@@ -31,16 +32,51 @@ type proxyResponse struct {
 	Body string `json:"body"`
 }
 
-func makeHomeHandler(req chan proxyRequest, res chan proxyResponse, s Semaphore) func(http.ResponseWriter, *http.Request) {
+type homeConnection struct {
+	requests chan proxyRequest
+	responses chan proxyResponse
+	sem Semaphore
+}
+
+func newHomeConnection() *homeConnection{
+	return &homeConnection{requests: make(chan proxyRequest), responses: make(chan proxyResponse), sem: make(Semaphore, 1)}
+}
+
+func (h *homeConnection) sendRequest(request proxyRequest) (*proxyResponse, error) {
+	h.sem.P(1)
+	h.requests <- request
+	select {
+	case targetResponse := <- h.responses: {
+		h.sem.V(1)
+		return &targetResponse, nil
+	}
+	case <-time.After(time.Second * 2):
+		h.sem.V(1)
+		return nil,errors.New("Got no response")
+	}
+}
+
+func (h *homeConnection) pollForRequest(response proxyResponse) (*proxyRequest, error) {
+	if len(response.Body) > 0 {
+		h.responses <- response
+	}
+	var nextRequestFromClient proxyRequest
+	select {
+	case nextRequestFromClient = <-h.requests:
+		return &nextRequestFromClient, nil
+	case <-time.After(time.Second * 10):
+		return nil,errors.New("Timeout")
+	}
+}
+
+
+
+func makeHomeHandler(home *homeConnection) func(http.ResponseWriter, *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
-		s.P(1)
 		request := makeProxyRequest(r)
-		req <- request
-		select {
-		case targetResponse := <- res: {
-			s.V(1)
-			data := targetResponse.Body
-			sDec, _ := b64.StdEncoding.DecodeString(data)
+		targetResponse, err := home.sendRequest(request)
+		if (err == nil) {
+			sDec, _ := b64.StdEncoding.DecodeString(targetResponse.Body)
 			for _,header := range targetResponse.Headers {
 				h := strings.Split(header, ":")
 				if !strings.EqualFold(h[0], "Content-Length") {
@@ -48,15 +84,11 @@ func makeHomeHandler(req chan proxyRequest, res chan proxyResponse, s Semaphore)
 				}
 			}
 			w.Write(sDec)
-
-		}
-		case <-time.After(time.Second * 2):
-			s.V(1)
 		}
 	}
 }
 
-func makePollHandler(req chan proxyRequest, res chan proxyResponse) func(http.ResponseWriter, *http.Request) {
+func makePollHandler(home *homeConnection) func(http.ResponseWriter, *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		decoder := json.NewDecoder(r.Body)
 		var targetResponse proxyResponse
@@ -64,30 +96,21 @@ func makePollHandler(req chan proxyRequest, res chan proxyResponse) func(http.Re
 		if err != nil {
 			fmt.Printf("Error decoding!")
 		}
-		if len(targetResponse.Body) > 0 {
-			res <- targetResponse
-		}
-		var op proxyRequest
-		select {
-		case op = <-req:
-			op = op
-		case <-time.After(time.Second * 10):
-			op = proxyRequest{Uri : "", Headers: []string{}}
+		op, err := home.pollForRequest(targetResponse)
+		if (err != nil) {
+			op = &proxyRequest{Uri : "", Headers: []string{}}
 		}
 		json.NewEncoder(w).Encode(op)
-		//fmt.Fprintf(w, "{\"url\":\"%s\"}", op.Uri)
 	}
 }
 
 func main() {
-	requests := make(chan proxyRequest)
-	responses := make(chan proxyResponse)
-	sem := make(Semaphore, 1)
-	homeHandler := makeHomeHandler(requests, responses, sem)
+	home := newHomeConnection()
+	homeHandler := makeHomeHandler(home)
 	http.HandleFunc("/home", homeHandler)
 	http.HandleFunc("/web/", homeHandler)
 	http.HandleFunc("/media/", homeHandler)
-	pollHandler := makePollHandler(requests, responses)
+	pollHandler := makePollHandler(home)
 	http.HandleFunc("/poll", pollHandler)
 	http.ListenAndServe(":8080", nil)
 }
